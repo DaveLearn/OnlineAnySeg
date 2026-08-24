@@ -66,6 +66,7 @@ class TempScene:
     frames_dir: Path  # <work>/data/<scene_id>/frames
     scene_id: str
     export_to_frame: Dict[int, ObservationFrame]
+    canonical_k: np.ndarray  # shared intrinsic all written frames were resampled to
 
 
 def get_dataset_frame_from_observation_frame(observation_frame: ObservationFrame) -> Frame:
@@ -267,6 +268,62 @@ def determine_table_instance_id(
 # ---------------------------------------------------------------------------
 
 
+def _remap_grid(k_src: np.ndarray, k_dst: np.ndarray, h: int, w: int) -> Tuple[np.ndarray, np.ndarray]:
+    """cv2.remap grids that resample an image captured with k_src as if it had
+    been captured with k_dst (same camera center/orientation, different focal
+    length/principal point only -- exact for a pinhole model, since per-pixel
+    depth-along-optical-axis is invariant to K).
+    """
+    us, vs = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+    x = (us - k_dst[0, 2]) / k_dst[0, 0]
+    y = (vs - k_dst[1, 2]) / k_dst[1, 1]
+    map_x = (x * k_src[0, 0] + k_src[0, 2]).astype(np.float32)
+    map_y = (y * k_src[1, 1] + k_src[1, 2]).astype(np.float32)
+    return map_x, map_y
+
+
+def _resample_frame_to_intrinsic(
+    color: np.ndarray, depth: np.ndarray, k_src: np.ndarray, k_dst: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resample an RGB-D frame from its own intrinsic to a shared canonical
+    intrinsic. Needed because OnlineAnySeg's core reconstruction (TSDF
+    integration and 2D-mask backprojection alike) uses a single global
+    intrinsic for every frame in the sequence -- it has no per-frame intrinsic
+    support anywhere, unlike deg's heterogeneous fixed-camera work cells.
+    Pixels outside the source camera's field of view after the remap are
+    legitimately invalid (dst FOV may exceed src FOV) and come back as 0.
+    """
+    h, w = depth.shape
+    map_x, map_y = _remap_grid(k_src, k_dst, h, w)
+    color_out = cv2.remap(color, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # nearest-neighbour for depth: avoids blending near/far values across object boundaries
+    depth_out = cv2.remap(depth, map_x, map_y, interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return color_out, depth_out
+
+
+def _resample_label_from_intrinsic(label: np.ndarray, k_src: np.ndarray, k_dst: np.ndarray) -> np.ndarray:
+    """Inverse of _resample_frame_to_intrinsic for label maps: given a label
+    image in k_src's (canonical) pixel grid, resample it into k_dst's (a
+    frame's own native) pixel grid, so the exported InstanceMaskObjectsDef
+    aligns with each frame's actual native imagery. Same (input_K, output_K)
+    argument convention as _remap_grid/_resample_frame_to_intrinsic.
+    """
+    h, w = label.shape
+    map_x, map_y = _remap_grid(k_src, k_dst, h, w)
+    return cv2.remap(label, map_x, map_y, interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _sanitize_depth(depth: np.ndarray) -> np.ndarray:
+    """Zero out non-finite depth (sensor no-return regions). Left unsanitized,
+    inf survives a *1000 + clip(0, 65535) round trip as a finite-but-wrong
+    65.535 m value (usually caught by depth_far filtering downstream, but not
+    guaranteed), and NaN hits undefined behaviour under astype(uint16) --
+    exactly the class of bug fixed in dependencies/MaskClustering's
+    utils/mask_backprojection.py::prepare_depth_for_backprojection.
+    """
+    return np.where(np.isfinite(depth) & (depth > 0), depth, 0.0).astype(np.float32)
+
+
 def _sanitize_scene_id(raw_id: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
     cleaned = "".join(ch if ch in allowed else "_" for ch in raw_id)
@@ -281,6 +338,18 @@ def _write_scannet_temp_dataset(frames: List[Frame], scene_id: str, work_root: P
     equals scene_id. No mesh ply is written: the loader would pick up any
     *_vh_clean_2.ply next to frames/, and the deg mesh is only needed
     in-process for the vertex-label transfer.
+
+    OnlineAnySeg's core reconstruction (TSDF integration in Scene_rep AND 2D-mask
+    backprojection in voxelized_points.turn_mask_to_voxel) uses a single global
+    intrinsic for every frame -- it has no per-frame intrinsic support anywhere,
+    unlike deg's heterogeneous fixed-camera work cells. Every frame is resampled
+    to a shared canonical intrinsic (frame 0's, after the precommitted pose-only
+    ordering) before being written, so the geometry OnlineAnySeg reconstructs is
+    self-consistent across views. Depth is also sanitized for non-finite values
+    (sensor no-return regions) before the mm/uint16 conversion -- otherwise inf
+    survives as a finite-but-wrong 65.535 m value and NaN hits undefined
+    behaviour under astype(uint16); same class of bug fixed in
+    dependencies/MaskClustering's utils/mask_backprojection.py.
     """
     data_root = work_root / "data"
     scene_dir = data_root / scene_id
@@ -296,12 +365,12 @@ def _write_scannet_temp_dataset(frames: List[Frame], scene_id: str, work_root: P
     if len(frames) == 0:
         raise RuntimeError("No frames to export")
 
-    reference_k = frames[0].K.cpu().numpy()
+    canonical_k = frames[0].K.cpu().numpy()
     reference_shape = frames[0].depth.shape if frames[0].depth is not None else None
     for frame in frames[1:]:
-        if not np.allclose(frame.K.cpu().numpy(), reference_k, atol=1e-3):
-            logger.warning(
-                "Frame %s intrinsics differ from frame %s; OnlineAnySeg uses one shared intrinsic (frame 0's), matching the MaskClustering adapter.",
+        if not np.allclose(frame.K.cpu().numpy(), canonical_k, atol=1e-3):
+            logger.info(
+                "Frame %s intrinsics differ from frame %s; resampling to the shared canonical intrinsic before writing.",
                 frame.name,
                 frames[0].name,
             )
@@ -309,17 +378,22 @@ def _write_scannet_temp_dataset(frames: List[Frame], scene_id: str, work_root: P
             raise RuntimeError("OnlineAnySeg requires all frames to share one resolution")
 
     k4 = np.eye(4, dtype=np.float64)
-    k4[:3, :3] = reference_k
+    k4[:3, :3] = canonical_k
     np.savetxt(intrinsic_dir / "intrinsic_depth.txt", k4, fmt="%.8f")
 
     export_to_frame: Dict[int, ObservationFrame] = {}
     for idx, frame in enumerate(frames):
         color = (frame.color.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(str(color_dir / f"{idx}.jpg"), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
-
         depth = frame.depth.cpu().numpy() if frame.depth is not None else None
         if depth is None:
             raise RuntimeError("Depth is required for the OnlineAnySeg pipeline")
+        depth = _sanitize_depth(depth)
+
+        frame_k = frame.K.cpu().numpy()
+        if not np.allclose(frame_k, canonical_k, atol=1e-3):
+            color, depth = _resample_frame_to_intrinsic(color, depth, frame_k, canonical_k)
+
+        cv2.imwrite(str(color_dir / f"{idx}.jpg"), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
         depth_mm = (depth * 1000.0).clip(0, 65535).astype(np.uint16)
         cv2.imwrite(str(depth_dir / f"{idx}.png"), depth_mm)
 
@@ -331,7 +405,7 @@ def _write_scannet_temp_dataset(frames: List[Frame], scene_id: str, work_root: P
             name=frame.name,
             color=frame.color.cpu().numpy(),
             X_WV=frame.X_WV.cpu().numpy(),
-            K=frame.K.cpu().numpy(),
+            K=frame.K.cpu().numpy(),  # native K -- used to inverse-warp exported labels back
             depth=frame.depth.cpu().numpy() if frame.depth is not None else None,
         )
 
@@ -342,6 +416,7 @@ def _write_scannet_temp_dataset(frames: List[Frame], scene_id: str, work_root: P
         frames_dir=frames_dir,
         scene_id=scene_id,
         export_to_frame=export_to_frame,
+        canonical_k=canonical_k,
     )
 
 
@@ -522,6 +597,7 @@ def _composite_instance_groups(
     ori_mask_lists: List[List[Tuple[int, int]]],
     instance_dir: Path,
     export_to_frame: Dict[int, ObservationFrame],
+    canonical_k: np.ndarray,
     frames: List[Frame],
     workspace_masks: Dict[int, np.ndarray],
 ) -> Dict[str, np.ndarray]:
@@ -529,6 +605,11 @@ def _composite_instance_groups(
 
     Collision-free by construction: each raw (frame, mask_id) belongs to
     exactly one final instance. Label i+1 corresponds to pred_masks column i.
+    Stage 1 (CropFormer) ran on frames resampled to the shared canonical
+    intrinsic (see _write_scannet_temp_dataset), so masks are composited in
+    that space and then resampled back to each frame's own native intrinsic --
+    matching the pixel grid workspace_masks and the rest of the deg pipeline
+    expect -- before the workspace filter is applied.
     """
     export_frame_ids = sorted(export_to_frame)
     mask_dir = instance_dir / "mask"
@@ -538,7 +619,7 @@ def _composite_instance_groups(
         seg_images[frame_id] = cv2.imread(str(seg_path), cv2.IMREAD_UNCHANGED) if seg_path.exists() else None
 
     h, w = frames[0].depth.shape
-    result_by_export: Dict[int, np.ndarray] = {frame_id: np.zeros((h, w), dtype=np.int32) for frame_id in export_frame_ids}
+    canonical_labels: Dict[int, np.ndarray] = {frame_id: np.zeros((h, w), dtype=np.int32) for frame_id in export_frame_ids}
 
     for instance_idx, ori_list in enumerate(ori_mask_lists):
         label = instance_idx + 1
@@ -546,9 +627,16 @@ def _composite_instance_groups(
             seg = seg_images.get(frame_id)
             if seg is None:
                 continue
-            source_mask = seg == mask_id
-            source_mask &= workspace_masks[frame_id]
-            result_by_export[frame_id][source_mask] = label
+            canonical_labels[frame_id][seg == mask_id] = label
+
+    result_by_export: Dict[int, np.ndarray] = {}
+    for frame_id in export_frame_ids:
+        native_k = export_to_frame[frame_id].K
+        label = canonical_labels[frame_id]
+        if not np.allclose(native_k, canonical_k, atol=1e-3):
+            label = _resample_label_from_intrinsic(label, canonical_k, native_k)
+        label = np.where(workspace_masks[frame_id], label, 0)
+        result_by_export[frame_id] = label
 
     return {export_to_frame[frame_id].name: result_by_export[frame_id] for frame_id in export_frame_ids}
 
@@ -666,6 +754,7 @@ def initialize_scene(
         ori_mask_lists,
         instance_dir,
         temp_scene.export_to_frame,
+        temp_scene.canonical_k,
         frames,
         workspace_masks_by_frame,
     )

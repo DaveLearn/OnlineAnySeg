@@ -15,7 +15,12 @@ cam:
   bound: False  # no GT mesh bbox in the deg pipeline
 
 scene:
-  voxel_size: 0.025  # default: 0.025
+  # native 0.025 is calibrated for room-scale ScanNet; on a ~1.5 m work cell with
+  # cm-scale objects it yields a sparse lattice (~2k points across the whole tabletop,
+  # a 10 cm mug = ~4 voxels across) that starves FCGF geo features and instance sizes.
+  # 0.01 rescales the scene resolution to the regime; FCGF's own quantization
+  # (pc_extractor.voxel_size) stays at the checkpoint-native 0.025.
+  voxel_size: 0.01
   block_resolution: 4  # default: 4
   block_count: 100000  # default: 100000
   mask_num: 2500
@@ -25,6 +30,10 @@ scene:
   scene_radius_depth_ratio: 3
   dense_down_ratio: 4  # default: 4
   dense_down_ratio_sparse: 4
+  # native: Open3D extract_point_cloud default 3.0 ("voxel seen by 3+ frames") -- a stream-rate
+  # assumption; at 5 snapshot views it starves FCGF geo-feature extraction and the final export
+  # (verified: zero exported instances at 3.0 with otherwise-correct inputs)
+  pc_extract_weight_threshold: 1
 
 pc_extractor:
   geo_extractor_path: "third_party/FCGF/model/ResUNetBN2C-16feat-3conv.pth"

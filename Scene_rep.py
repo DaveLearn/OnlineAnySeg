@@ -106,12 +106,17 @@ class Scene_rep:
         self.containing_ratio = self.cfg["seg"]["containing_ratio"]  # default: 0.8
         self.contained_ratio = self.cfg["seg"]["contained_ratio"]  # default: 0.1
         self.merge_supporter_num = self.cfg["seg"]["merge_supporter_num"]  # supporter_num threshold, default: 5
+        # Open3D's extract_point_cloud default (3.0) requires TSDF weight from 3+ frames per
+        # voxel -- trivial in a stream, but proportionally far harsher at 3-5 total snapshot
+        # views, where it starves FCGF geo-feature extraction (get_pc_xyz) and the final
+        # export (get_pc). Config-gated; native default.
+        self.pc_extract_weight_threshold = self.cfg["scene"].get("pc_extract_weight_threshold", 3.0)
 
 
     #################################################### properties ####################################################
     @property
     def get_pc_xyz(self):
-        pcd = self.voxel_block_grids.extract_point_cloud()
+        pcd = self.voxel_block_grids.extract_point_cloud(weight_threshold=self.pc_extract_weight_threshold)
         points = pcd.point.positions.cpu().numpy()
         return points
 
@@ -801,20 +806,28 @@ class Scene_rep:
         # Step 1: sort each predicted instance by mask size, with ascending order
         pred_inst_size = torch.sum(pred_inst_masks, dim=-1)
         pred_inst_idx_asc = torch.argsort(pred_inst_size)
-        pred_inst_masks = pred_inst_masks[pred_inst_idx_asc]  # predicted instances' masks (sort by mask size, ascending order), Tensor(pred_inst_num, n), dtype=bool
+        sorted_inst_masks = pred_inst_masks[pred_inst_idx_asc]  # predicted instances' masks (sort by mask size, ascending order), Tensor(pred_inst_num, n), dtype=bool
 
         # Step 2: for each boundary points, it will be only assigned to 1 pred instance (with minimal mask size)
-        pred_inst_masks_new = keep_min_rows(pred_inst_masks)
+        pred_inst_masks_new = keep_min_rows(sorted_inst_masks)
         if return_list:
-            pred_inst_masks_new = [inst_mask for inst_mask in pred_inst_masks]
+            # Upstream returned the size-SORTED input here, which (a) discarded
+            # keep_min_rows' boundary reassignment and (b) silently permuted the
+            # returned masks against the caller's aligned lists (sem features /
+            # provenance) -- the exported pred_sem_features misalign with
+            # pred_masks whenever the sort reorders. Preserve upstream's
+            # effective mask content (no reassignment) but in the CALLER's order.
+            return [inst_mask for inst_mask in pred_inst_masks]
 
-        return pred_inst_masks_new
+        # tensor path: unsort keep_min_rows' result back to the caller's order
+        inverse_order = torch.argsort(pred_inst_idx_asc)
+        return pred_inst_masks_new[inverse_order]
 
     # @brief: do Marching Cubes to get reconstruction result (extract vertices of reconstructed mesh as pointcloud)
     #-@return points: ndarray(vert_num, 3);
     #-@return colors: ndarray(vert_num, 3).
     def get_pc(self):
-        pcd = self.voxel_block_grids.extract_point_cloud()
+        pcd = self.voxel_block_grids.extract_point_cloud(weight_threshold=self.pc_extract_weight_threshold)
         points = pcd.point.positions.cpu().numpy()
         colors = pcd.point.colors.cpu().numpy()
         return points, colors

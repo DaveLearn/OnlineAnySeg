@@ -365,14 +365,32 @@ before any evaluation was run.
 | 10b | -- | `future-fstrings` pypi dep added | vendored `third_party/FCGF/{model,lib}/*.py` declare a `# -*- coding: future_fstrings -*-` source encoding from a py2/py3 compat era; Python refuses to import the file at all without the codec registered, even on py3.11 where the declaration is otherwise a no-op |
 | 11 | `vis_color`/`vis_pc` available | forced off | upstream bug: visualizer reads CLI args `main.py` never defines |
 | 12 | `filter_instances` size 200, `min_mask_pixel_size` 500, voxel 0.025 | native defaults (exposed as knobs) | any change from native must be re-recorded here |
+| 13 | one global camera intrinsic for the whole sequence (TSDF integration and mask backprojection both) | every frame's color+depth resampled to a shared canonical intrinsic (frame 0's after the precommitted ordering) before writing; exported label maps inverse-warped back to each frame's native intrinsic | input plumbing: deg work cells use heterogeneous cameras (e.g. fx 920 vs 636 in the same scene); the method has no per-frame intrinsic support. Without this the multi-view TSDF is inconsistent (measured: 37-point reconstruction) |
+| 14 | -- | non-finite depth zeroed before the mm/uint16 conversion | input plumbing: inf/NaN sensor no-returns otherwise corrupt to finite 65.535 m values (same fix as MaskClustering's `prepare_depth_for_backprojection`) |
+| 15 | Open3D `extract_point_cloud` default weight_threshold 3.0 ("voxel confirmed by 3+ integrated frames") | 1 (config-gated, native default in code) | stream-rate assumption: in a stream every voxel is seen dozens of times; at 5 snapshot views 3.0 starves FCGF geo-feature extraction and the final export (verified: zero exported instances at 3.0 with otherwise-correct inputs) |
+| 16 | `scene.voxel_size` 0.025 (room-scale ScanNet) | 0.01 | scene-scale rescaling: at 25 mm a ~1.5 m work cell reconstructs as a ~2k-point lattice (a 10 cm mug is ~4 voxels across), starving geo features and instance sizes; verified visually and by workspace point count (2,023 -> 13,194). `pc_extractor.voxel_size` stays at the FCGF checkpoint-native 0.025. Comparable scale to the other baselines (SAM3D merges at 3.5 mm; the deg mesh is ~4 mm) |
+
+**Deliberately NOT changed:** OnlineAnySeg keeps building its own incremental TSDF from the
+(resampled) sensor depth. Injecting the deg pipeline's fused mesh (e.g. by rendering per-view
+depth from it) was considered and rejected: the online incremental reconstruction is part of
+the method under evaluation, and substituting the shared offline substrate would make the
+comparison a different method. Rows 13-15 are input plumbing and precommitted stream-rate
+constant rescaling only.
 
 Fork code changes (each an ordinary commit): per-instance `ori_mask_list`
 provenance exported next to `ckpt_final.npz` (as `ckpt_final_ori_masks.json`);
 `filter_instances` size threshold read from config; RNG seeding in `main.py`;
 `latest_seg_img` first-frame guard in `ScannetDataset`; `mask_predict.py`
 wrapper (path-injects the bootstrapped CropFormer tree, fixes the upstream
-crash on zero-mask frames). `MyDataset` is broken upstream (unjoined paths,
-mask-stem mismatch, uninitialized `latest_seg_img`) and is bypassed, not fixed.
+crash on zero-mask frames); `process_mask_boundary_pts` order fix — upstream
+silently returned masks size-SORTED, permuting the exported `pred_masks`
+columns against `pred_sem_features` and any aligned metadata (latent upstream
+bug: every upstream npz has misaligned sem features whenever the sort reorders;
+unnoticed because their class-agnostic eval never reads them). The fix returns
+masks in caller order with content unchanged (upstream's `return_list` path
+also discarded `keep_min_rows`' boundary reassignment, which is preserved
+as-is). `MyDataset` is broken upstream (unjoined paths, mask-stem mismatch,
+uninitialized `latest_seg_img`) and is bypassed, not fixed.
 
 ### Native sanity check (ScanNet/SceneNN)
 
