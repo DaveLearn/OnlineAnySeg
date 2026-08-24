@@ -392,6 +392,18 @@ also discarded `keep_min_rows`' boundary reassignment, which is preserved
 as-is). `MyDataset` is broken upstream (unjoined paths, mask-stem mismatch,
 uninitialized `latest_seg_img`) and is bypassed, not fixed.
 
+### Measured stochasticity bound
+
+Stage 1 (CropFormer + CLIP) is bit-deterministic across runs (verified: identical
+mask pngs). Stage 2 is not: MinkowskiEngine's sparse-conv kernels use GPU atomics
+(not governed by torch's determinism flags), so FCGF features jitter between runs
+and merge decisions near the `sim_merge_thresh` boundary can flip. Measured on
+mug1_aruco (two runs, identical inputs): PQ identical (0.7385), AP50/AP25 identical
+(1.0), strict-rung 3D AP varied 0.22 vs 0.44 (one IoU rung on one object), labeled
+mesh-vertex overlap between runs IoU 0.69 (boundary-shell dominated on a small
+object). Protocol: single run per scene (`run_number 1`), like every other
+baseline; scene-level bootstrap absorbs per-scene draw noise.
+
 ### Native sanity check (ScanNet/SceneNN)
 
 Data is license-gated and stays manual; installs are automatic.
