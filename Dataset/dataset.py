@@ -202,6 +202,10 @@ class ScannetDataset(Dataset):
 
         self.pinhole_cam_intrinsic = self.get_intrinsics(self.cam_intrinsic.cpu().numpy())  # o3d.camera.PinholeCameraIntrinsic obj
 
+        # guard: __getitem__ falls back to latest_seg_img on frames without a seg result;
+        # initialize it so the very first frame lacking one doesn't crash
+        self.latest_seg_img = torch.zeros((self.target_h, self.target_w), dtype=torch.uint8, device=self.device)
+
 
     def get_scene_img_num(self):
         color_img_list = os.listdir(os.path.join(self.data_location, "color"))

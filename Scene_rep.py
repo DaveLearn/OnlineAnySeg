@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import cv2
 import numpy as np
@@ -1006,13 +1007,15 @@ class Scene_rep:
 
         # Step 4: save semantic feature of each valid instance
         sem_feature_list = [instance.get_semantic_feature for instance in valid_instances]
+        ori_mask_lists = [instance.ori_mask_list for instance in valid_instances]  # provenance: (frame_id, 2D mask_id) pairs merged into each instance
 
         # Step 5: keep only info of final valid instances
         valid_merged_mask_ids = valid_merged_mask_ids[final_valid_idx]
         mask_voxel_coords_list = [mask_voxel_coords_list[idx] for idx in range(num_instances) if idx in final_valid_idx]
         sem_feature_list = [sem_feature_list[idx] for idx in range(num_instances) if idx in final_valid_idx]
+        ori_mask_lists = [ori_mask_lists[idx] for idx in range(num_instances) if idx in final_valid_idx]
 
-        return instance_mask_list, valid_merged_mask_ids, mask_voxel_coords_list, sem_feature_list, mask_scene_pts_coords_list
+        return instance_mask_list, valid_merged_mask_ids, mask_voxel_coords_list, sem_feature_list, mask_scene_pts_coords_list, ori_mask_lists
 
 
     # @brief: save latest reconstructed results and per-instance segmentation results
@@ -1029,7 +1032,7 @@ class Scene_rep:
 
         # Step 2: get current detected 3D instances info
         # 2.1: get each pred instance's semantic feature, mask
-        instance_mask_list, valid_merged_mask_ids, mask_voxel_coords_list, sem_feature_list, mask_scene_pts_coords_list = self.get_valid_instances(scene_points=self.points)
+        instance_mask_list, valid_merged_mask_ids, mask_voxel_coords_list, sem_feature_list, mask_scene_pts_coords_list, ori_mask_lists = self.get_valid_instances(scene_points=self.points)
         instance_feature_list = [instance_sem_feature.cpu().numpy() for instance_sem_feature in sem_feature_list]
 
         # 2.2: for each pred instance mask, process boundary points
@@ -1038,7 +1041,8 @@ class Scene_rep:
 
 
         # # Step 3: for each pred 3D instance, apply DBSCAN for filtering
-        instance_mask_list_filtered, instance_feature_list_filtered, valid_instance_indices = filter_instances(self.points, instance_mask_list, instance_feature_list)
+        min_instance_points = self.cfg["seg"].get("min_instance_points", 200)
+        instance_mask_list_filtered, instance_feature_list_filtered, valid_instance_indices = filter_instances(self.points, instance_mask_list, instance_feature_list, size_thresh=min_instance_points)
 
         # Step 4: save current reconstruction result
         recon_pc_path = os.path.join(ckpt_save_dir, "recon_%d.ply" % frame_id)
@@ -1046,6 +1050,18 @@ class Scene_rep:
 
         if ckpt_path is None:
             ckpt_path = os.path.join(ckpt_save_dir, "ckpt_%d.npz" % frame_id)
+
+        # per-instance provenance: the (frame_id, 2D mask_id) pairs that were merged into each
+        # exported instance, aligned with the pred_masks columns of the npz. Written even when
+        # zero instances survive (the npz is skipped then), so consumers can distinguish
+        # "no instances" from "no run".
+        if filter_flag:
+            ori_mask_lists_export = [ori_mask_lists[i] for i in valid_instance_indices]
+        else:
+            ori_mask_lists_export = ori_mask_lists
+        ori_masks_path = os.path.splitext(ckpt_path)[0] + "_ori_masks.json"
+        with open(ori_masks_path, "w") as f:
+            json.dump([[[int(fid), int(mid)] for fid, mid in ori_list] for ori_list in ori_mask_lists_export], f)
 
         if filter_flag:
             export_instance_mask(ckpt_path, instance_mask_list_filtered, instance_feature_list_filtered)  # with DBSCAN

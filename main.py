@@ -2,6 +2,8 @@ import sys
 sys.path.append("third_party/FCGF")
 import argparse
 import os
+import random
+import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +24,12 @@ if __name__ == '__main__':
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("-o", "--output_dir", default="./output/scannet")
     args = parser.parse_args()
+
+    # determinism: seed all RNGs so repeated runs on the same input agree
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
 
     cfg = config.load_config(args.config)
 

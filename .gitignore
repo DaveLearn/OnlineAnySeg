@@ -28,3 +28,10 @@ eval/scannet200/validation/*
 eval/sceneNN/*
 !eval/sceneNN/sceneNN_gt_seg.zip
 
+# DEG pixi adapter artifacts
+.pixi/
+.build/
+checkpoints/
+outputs/
+eval/.gt_seg_unpacked
+

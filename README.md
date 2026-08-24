@@ -286,3 +286,105 @@ If you find our code or paper useful, please cite
   year={2025}
 }
 ```
+
+
+---
+
+## DEG Pixi Setup (DaveLearn fork, `paper-release` branch)
+
+This fork integrates OnlineAnySeg as an external baseline of the deg workspace.
+Fork base = upstream `yjtang249/OnlineAnySeg` @ `152466e318f8220bcc6838c03e340cce2f2153b8`
+(upstream HEAD at integration time, 2026-08-24). See `THIRD_PARTY.md` for provenance.
+
+### Zero-manual-step contract
+
+From a clean recursive checkout, the workspace launcher
+
+```
+bash scripts/external_segmentation_initializers/onlineanyseg.sh <transforms.json> <scene.pkl>
+```
+
+runs `pixi run --frozen segment_external`, whose bootstrap chain (all
+`outputs`-cached, first run only) clones and builds MinkowskiEngine (pinned
+`02fc608b`, ~10-20 min), builds pytorch3d v0.7.5 from source, and downloads the
+~3.9 GB OpenCLIP checkpoint. ME is unmaintained and does not compile against
+CUDA >= 11.6 as released; `scripts/patch_minkowski_sources.py` applies the
+canonical fixes before every build: explicit thrust includes (upstream issues
+#543/#621) and a `shared_ptr(raw, deleter)` construction in
+`coordinate_map_gpu.cuh` replacing the `shared_ptr(unique_ptr&&)` conversion,
+whose unqualified `__to_address` call is ADL-ambiguous because `thrust::pair`
+is `cuda::std::pair` there (upstream issue #596). pytorch3d likewise needs
+`scripts/patch_pytorch3d_sources.py`: pulsar's `make_float3` fallback in
+`global.h` is guarded to CPU-only builds (under WITH_CUDA it duplicates CUDA's
+own and every pulsar host call is ambiguous). Build parallelism is capped
+at 4 jobs (nproc-wide nvcc OOMs a 32 GB host). Stage 1's
+own chain (Entity/CropFormer clone + MultiScaleDeformableAttention build) hangs
+off the `mask_predict` task in the `cropformer` environment and resolves on the
+first scene run. The **one token-gated step** (same status as MaskClustering):
+
+```
+HF_TOKEN=... pixi run -e cropformer download_cropformer_checkpoint
+```
+
+### Two pixi environments
+
+| env | stage | stack |
+| --- | --- | --- |
+| `default` | stage 2 (`main.py` + FCGF/MinkowskiEngine) + deg adapter | py3.11, torch 2.1.0+cu118, nvcc 11.8, gcc 11 (README-pinned torch; py3.11 forced by the shared deg packages; pytorch3d source-built, no py311/cu118 wheel exists) |
+| `cropformer` | stage 1 (CropFormer masks + CLIP embeddings) | MaskClustering's conda-binary stack (detectron2/pytorch 2.10/mmcv cuda129py311) + open-clip-torch |
+
+No single torch has both a conda-forge detectron2 binary and a feasible
+MinkowskiEngine source build, hence the split. The adapter invokes stage 1 as a
+`pixi run --frozen -e cropformer mask_predict` subprocess with
+LD_LIBRARY_PATH/CFLAGS scrubbed (cross-env leak, see `scripts/build_cropformer_ops.sh`).
+
+### Precommitted frame ordering (pose-only)
+
+OnlineAnySeg is a streaming method; deg scenes are 3-5 unordered fixed cameras.
+Frames are ordered by the same precommitted pose-only rule as the SAM2Object
+baseline (`segmenter.py::_order_frames_for_video`): up-axis from the ground
+plane normal, cameras sorted by azimuth about the centroid of camera centers
+(zero direction = world +X projected into the plane; ties by height, then frame
+id). Uses only poses and the ground plane -- never labels or results. Committed
+before any evaluation was run.
+
+### DEG deviations from the native method
+
+| # | Native | DEG | Why |
+| --- | --- | --- | --- |
+| 1 | `keyframe_freq` 10-20, `seg_add_interval` 10, `merge_kf_interval` 5 | 1 / 1 / 1 | 5 unordered fixed views, not a stream; at native intervals merging never fires and the output is empty |
+| 2 | `mask_weight_threshold` 5 | 1 | 5 co-observations is unreachable at ~5 total frames; the deg pipeline applies its own uniform >=3-frame filter to every baseline |
+| 3 | stage-1 `seg_interval` 10-20 | 1 | every view is segmented |
+| 4 | `h_crop`/`w_crop` 10, `bound` True | 0 / False | no ScanNet edge artifacts; no GT mesh |
+| 5 | streaming frame order | precommitted pose-only azimuth ring (above) | unordered fixed cameras |
+| 6 | 2D output: none (evaluates on recon cloud) | per-frame label images composited from the method's own merged 2D masks via `ori_mask_list` provenance | deg metric needs per-frame masks; compositing uses the method's native 2D evidence (no raycasting). The 3D DBSCAN/boundary refinement is not re-projected into 2D |
+| 7 | eval on recon cloud | refined 3D result (post boundary-processing + DBSCAN) transferred to the deg mesh vertices by NN @ 0.15 m | same bound as upstream's own evaluation (`eval/evaluate_seqs.py`) |
+| 8 | -- | workspace crop, table-instance removal, >=3-frame filter | deg parity filters, applied identically to all baselines |
+| 9 | conda py3.9 / torch 2.1.0+cu118 (single env) | default env py3.11, same torch (shared deg packages require 3.11); pytorch3d source-built; stage 1 on MaskClustering's cuda129 stack | binary availability; model weights identical |
+| 10 | `torch_scatter`, `torchmetrics` in requirements.txt | omitted | dead requirements -- never imported |
+| 10b | -- | `future-fstrings` pypi dep added | vendored `third_party/FCGF/{model,lib}/*.py` declare a `# -*- coding: future_fstrings -*-` source encoding from a py2/py3 compat era; Python refuses to import the file at all without the codec registered, even on py3.11 where the declaration is otherwise a no-op |
+| 11 | `vis_color`/`vis_pc` available | forced off | upstream bug: visualizer reads CLI args `main.py` never defines |
+| 12 | `filter_instances` size 200, `min_mask_pixel_size` 500, voxel 0.025 | native defaults (exposed as knobs) | any change from native must be re-recorded here |
+
+Fork code changes (each an ordinary commit): per-instance `ori_mask_list`
+provenance exported next to `ckpt_final.npz` (as `ckpt_final_ori_masks.json`);
+`filter_instances` size threshold read from config; RNG seeding in `main.py`;
+`latest_seg_img` first-frame guard in `ScannetDataset`; `mask_predict.py`
+wrapper (path-injects the bootstrapped CropFormer tree, fixes the upstream
+crash on zero-mask frames). `MyDataset` is broken upstream (unjoined paths,
+mask-stem mismatch, uninitialized `latest_seg_img`) and is bypassed, not fixed.
+
+### Native sanity check (ScanNet/SceneNN)
+
+Data is license-gated and stays manual; installs are automatic.
+
+```
+pixi run -e cropformer mask_predict -- --root data/scannet --seq_name scene0011_00 \
+    --image_path_pattern "frames/color/*" --seg_interval 10 \
+    --pretrained_path checkpoints/clip/open_clip_pytorch_model.bin \
+    --output_root data/scannet/seg_result \
+    --opts MODEL.WEIGHTS checkpoints/cropformer/Mask2Former_hornet_3x_576d0b.pth
+pixi run run_native_main -- -c config/scannet_cropformer.yaml --seq_name scene0011_00 \
+    -d data/scannet/scene0011_00/frames -i data/scannet/seg_result/scene0011_00 -o output/scannet
+pixi run run_native_eval -- --pred_path output/scannet ...   # GT zips unpacked automatically
+```
