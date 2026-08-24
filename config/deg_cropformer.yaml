@@ -39,6 +39,13 @@ pc_extractor:
   geo_extractor_path: "third_party/FCGF/model/ResUNetBN2C-16feat-3conv.pth"
   voxel_size: 0.025
   feature_dim: 16
+  # native: hardcoded 50 scene points inside a mask's voxel set before it gets a geometric
+  # feature; featureless masks are excluded from ALL merging. Exposed as a knob; keep the
+  # native default. Relaxing was tested twice and REJECTED: 10 (with native supporter=5)
+  # regressed mug1_aruco PQ 0.738 -> 0.0, and a bisect at 1 proved the gate is NOT the
+  # 3-frame binding constraint -- with features present on every object mask, cross-view
+  # merging still fails on the voxel-overlap criteria (see README rows 17-18).
+  min_pts_num: 50
 
 mapping:
   keyframe_freq: 1  # native: 10-20 (stream subsampling); every one of the ~5 views is integrated
@@ -64,7 +71,7 @@ mapping:
 
 seg:
   seman_min_value: 0.6
-  merge_overlap_thresh: 0.4  # default: 0.4
+  merge_overlap_thresh: 0.4  # default: 0.4. Lowering to 0.35 was tested (few-view bias hypothesis) and REJECTED: no 3-frame rescue, degrades 5-view (mug1 0.738->0.551, multiple1 0.687->0.373)
   with_feature: True
   sim_merge_thresh: 2.3  # default: 2.3
   merge_contain_iter_num: 10
@@ -73,7 +80,11 @@ seg:
   contain_feature_sim_thresh_list: [2.1, 2.2, 2.3]
   containing_ratio: 0.8  # default: 0.8
   contained_ratio: 0.3
-  merge_supporter_num: 5
+  # native: 5 -- a weighted co-observation count calibrated for stream density, structurally
+  # starved at 3-5 snapshot views (a mask pair can collect only a handful of supporters).
+  # 2 restores the supporter merge pathway; verified equal-or-better on every eg scene
+  # tested (fixes single1, improves fall_1/multiple1, mug1/single2/single3 unchanged).
+  merge_supporter_num: 2
   score_threshold: 0.4
   good_score_threshold: 0.6
   seg_add_interval: 1  # native: 10 (stream subsampling); every view carries masks

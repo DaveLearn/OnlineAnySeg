@@ -17,6 +17,7 @@ class PointFeatureExtractor:
         self.voxel_size = self.cfg["pc_extractor"]["voxel_size"]  # default: 0.025
         self.feature_dim = self.cfg["pc_extractor"]["feature_dim"]  # default: 16
         self.ckpt_path = self.cfg["pc_extractor"]["geo_extractor_path"]
+        self.min_pts_num = self.cfg["pc_extractor"].get("min_pts_num", 50)  # min scene points inside a mask's voxels for a geometric feature; default: 50
         self.model = self.create_load_model()
 
 
@@ -78,7 +79,9 @@ class PointFeatureExtractor:
     #-@return mask_geo_feature_list: each mask's geometric feature, list of Tensor(feature_dim, ), dtype=float32;
     #-@return pts_feature: extracted per-point feature, Tensor(n, feature_dim), dtype=float32;
     #-@return scene_points: input pointcloud, Tensor(n, 3), dtype=float32.
-    def get_masks_geometric_features(self, mask_voxel_coord_list, scene_points, pts_feature=None, dist_aggr=False, min_pts_num=50):
+    def get_masks_geometric_features(self, mask_voxel_coord_list, scene_points, pts_feature=None, dist_aggr=False, min_pts_num=None):
+        if min_pts_num is None:
+            min_pts_num = self.min_pts_num
         # Step 1: extract feature pointcloud (if needed)
         if pts_feature is not None and scene_points.shape[0] == pts_feature.shape[0]:
             # if feature pointcloud is provided, skip extracting feature pc
